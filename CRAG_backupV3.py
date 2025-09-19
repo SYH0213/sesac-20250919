@@ -33,6 +33,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.stores import BaseStore  # ✅ BaseStore는 여기로 이동됨
+from langchain_core.messages import BaseMessage
 
 # LangGraph
 from langgraph.graph import END, START, StateGraph
@@ -46,6 +47,37 @@ from langchain_tavily import TavilySearch
 
 # --- Add: Persistent JSON-backed DocStore for parents ---
 
+# --------------------------
+# 유틸: Gradio용 히스토리 변환
+# --------------------------
+def to_lc_messages(history: List[dict]) -> List:
+    msgs = []
+    for m in history:
+        if m["role"] == "user":
+            msgs.append(HumanMessage(content=m["content"]))
+        elif m["role"] == "assistant":
+            msgs.append(AIMessage(content=m["content"]))
+    return msgs
+
+
+def to_gradio_history(messages: List[BaseMessage]) -> List[dict]:
+    history = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            history.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            history.append({"role": "assistant", "content": msg.content})
+    return history
+
+
+# --------------------------
+# 전역 Debug Log 저장소
+# --------------------------
+debug_logs = []
+
+def log_debug(msg: str):
+    debug_logs.append(msg)
+    print(msg)  # 콘솔에도 그대로 찍어줌
 
 class JSONDocStore(BaseStore[str, Document]):
     """
@@ -222,7 +254,6 @@ ga_system_prompt = (
     "You are a helpful assistant. Your task is to answer the user's question based on the provided context. "
     "The context may come from PDF documents or from web search results. "
     "If useful information is present in the context (including web search), provide a concise answer. "
-    "If the answer cannot be found within the provided context, you MUST say '제공된 문서나 검색 결과의 내용으로는 답변할 수 없습니다.' "
     "\n\nContext:\n{context}"
 )
 
@@ -287,7 +318,68 @@ class GraphState(TypedDict):
     generation: str
     web_search: str
     documents: List[Document]
-    chat_history: List  # HumanMessage/AIMessage 리스트
+    chat_history: List[BaseMessage]
+    intent: str  # "conversational" or "question"
+
+
+# --------------------------------------
+# 새 노드/Chain: 입력 의도 분류
+# --------------------------------------
+class ClassifyIntent(BaseModel):
+    """"conversational" 또는 "question"으로 사용자 입력의 의도를 분류합니다."""
+    intent: str = Field(description="사용자 입력의 의도. 'conversational' 또는 'question' 중 하나여야 합니다.")
+
+classify_system_prompt = """You are a router that classifies the user's input intent. Based on the user's latest message and the previous conversation history, determine if the input is a simple conversation/chit-chat or a question that requires information.
+- General greetings like "Hello", "Thank you", "Have a nice day" are 'conversational'.
+- Responses to previous answers (e.g., "That's interesting", "I see") are also 'conversational'.
+- If the input requires finding information from a PDF document or the web, it is a 'question'.
+- If in doubt, classify it as 'question'."""
+
+classify_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", classify_system_prompt),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ]
+)
+structured_llm_classifier = llm.with_structured_output(ClassifyIntent)
+intent_classifier = classify_prompt | structured_llm_classifier
+
+
+def node_classify_input(state: GraphState) -> GraphState:
+    """사용자 입력의 의도를 분류하여 state에 저장"""
+    log_debug("---CLASSIFYING INPUT INTENT---")
+    intent_result = intent_classifier.invoke({
+        "question": state["question"],
+        "chat_history": state.get("chat_history", [])
+    })
+    log_debug(f"  [Intent] Classified as: {intent_result.intent}")
+    return {"intent": intent_result.intent}
+
+
+# --------------------------------------
+# 새 노드/Chain: 단순 대화형 답변 생성
+# --------------------------------------
+conv_gen_system_prompt = """You are a friendly AI assistant. Respond to the user's message in a natural, conversational way. Do not search for information; just generate a simple response that fits the context of the conversation."""
+
+conv_gen_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", conv_gen_system_prompt),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{input}"),
+    ]
+)
+conversational_chain = conv_gen_prompt | llm | StrOutputParser()
+
+
+def node_generate_conversational_response(state: GraphState) -> GraphState:
+    """단순 대화형 답변을 생성"""
+    log_debug("---GENERATING CONVERSATIONAL RESPONSE---")
+    generation = conversational_chain.invoke({
+        "input": state["question"],
+        "chat_history": state.get("chat_history", [])
+    })
+    return {"generation": generation}
 
 
 # --------------------------
@@ -360,7 +452,7 @@ def node_grade_documents(state: GraphState) -> GraphState:
 
 def node_decide_to_generate(state: GraphState) -> str:
     print("---ASSESS GRADED DOCUMENTS---")
-    return "transform_query" if state["web_search"] == "Yes" else "generate"
+    return "notify_user" if state["web_search"] == "Yes" else "generate"
 
 def node_transform_query(state: GraphState) -> GraphState:
     print("---TRANSFORM QUERY---")
@@ -379,19 +471,28 @@ def node_web_search(state: GraphState) -> GraphState:
     question = state["question"]
 
     if web_search_tool is None:
-        # 웹검색 불가 시 안내 문서 추가
         web_results_text = "웹검색 API 키가 설정되지 않아 웹검색을 수행하지 못했습니다."
     else:
         try:
             results = web_search_tool.invoke({"query": question})
-            lines = []
-            for r in results:
-                # r keys: content, url, score, title 등
-                title = r.get("title") or ""
-                url = r.get("url") or ""
-                content = r.get("content") or ""
-                lines.append(f"[{title}] {url}\n{content}\n")
-            web_results_text = "\n---\n".join(lines) if lines else "검색결과가 비어 있습니다."
+
+            # ✅ 결과가 문자열일 때 대비
+            if isinstance(results, str):
+                web_results_text = results
+            elif isinstance(results, list):
+                lines = []
+                for r in results:
+                    if isinstance(r, dict):  # dict 타입만 처리
+                        title = r.get("title", "")
+                        url = r.get("url", "")
+                        content = r.get("content", "")
+                        lines.append(f"[{title}] {url}\n{content}\n")
+                    else:
+                        lines.append(str(r))  # dict가 아니면 문자열 변환
+                web_results_text = "\n---\n".join(lines) if lines else "검색결과가 비어 있습니다."
+            else:
+                web_results_text = str(results)
+
         except Exception as e:
             web_results_text = f"웹검색 중 오류: {e}"
 
@@ -403,6 +504,7 @@ def node_web_search(state: GraphState) -> GraphState:
         "chat_history": state["chat_history"],
         "generation": state.get("generation", ""),
     }
+
 
 def node_generate(state: GraphState) -> GraphState:
     print("---GENERATE---")
@@ -433,50 +535,75 @@ def node_generate(state: GraphState) -> GraphState:
 
 
 # --------------------------
+# 새 노드: 사용자 알림
+# --------------------------
+def node_notify_user(state: GraphState) -> GraphState:
+    log_debug("---NOTIFY USER---")
+    notice = "문서에서 답변을 찾지 못했습니다. 인터넷 검색을 시도합니다."
+    chat_history = state.get("chat_history", [])
+    chat_history.append(AIMessage(content=notice))  # ✅ dict로만 유지
+    return {**state, "chat_history": chat_history}
+
+
+
+# --------------------------
 # 그래프 구성 & 컴파일
 # --------------------------
 workflow = StateGraph(GraphState)
+
+# 1. 새 노드 등록
+workflow.add_node("classify_input", node_classify_input)
+workflow.add_node("generate_conversational_response", node_generate_conversational_response)
+
+# 2. 기존 노드 등록
 workflow.add_node("retrieve", node_retrieve)
 workflow.add_node("grade_documents", node_grade_documents)
 workflow.add_node("generate", node_generate)
+workflow.add_node("notify_user", node_notify_user)
 workflow.add_node("transform_query", node_transform_query)
 workflow.add_node("web_search_node", node_web_search)
 
-workflow.add_edge(START, "retrieve")
+# 3. 시작점 변경
+workflow.add_edge(START, "classify_input")
+
+# 4. 의도에 따른 조건부 분기
+def decide_flow(state: GraphState) -> str:
+    log_debug(f"---DECIDING FLOW BASED ON INTENT: {state['intent']}---")
+    if state["intent"] == "conversational":
+        return "generate_conversational_response"
+    else:
+        return "retrieve"
+
+workflow.add_conditional_edges(
+    "classify_input",
+    decide_flow,
+    {
+        "generate_conversational_response": "generate_conversational_response",
+        "retrieve": "retrieve",
+    },
+)
+
+# 5. 기존 RAG/CRAG 흐름 연결
 workflow.add_edge("retrieve", "grade_documents")
 workflow.add_conditional_edges(
     "grade_documents",
     node_decide_to_generate,
-    {"transform_query": "transform_query", "generate": "generate"},
+    {
+        "generate": "generate",
+        "notify_user": "notify_user",
+    },
 )
+workflow.add_edge("notify_user", "transform_query")
 workflow.add_edge("transform_query", "web_search_node")
 workflow.add_edge("web_search_node", "generate")
+
+# 6. 종료점 연결
 workflow.add_edge("generate", END)
+workflow.add_edge("generate_conversational_response", END)
 
 app = workflow.compile()
 
 
-# --------------------------
-# 유틸: Gradio용 히스토리 변환
-# --------------------------
-def to_lc_messages(history: List[dict]) -> List:
-    msgs = []
-    for m in history:
-        if m["role"] == "user":
-            msgs.append(HumanMessage(content=m["content"]))
-        elif m["role"] == "assistant":
-            msgs.append(AIMessage(content=m["content"]))
-    return msgs
-
-
-# --------------------------
-# 전역 Debug Log 저장소
-# --------------------------
-debug_logs = []
-
-def log_debug(msg: str):
-    debug_logs.append(msg)
-    print(msg)  # 콘솔에도 그대로 찍어줌
 
 
 # --------------------------
@@ -508,9 +635,12 @@ def run_crag(query: str, history: List[dict], show_debug: bool):
         else:
             context_md += "참조된 문서가 없습니다."
 
-        # 히스토리 추가
-        if history is None:
-            history = []
+        # 히스토리 추가 (수정된 로직)
+        # 그래프 실행 후의 최종 대화 기록을 가져옴 (여기엔 notify 메시지 등이 포함될 수 있음)
+        final_lc_history = final_state.get("chat_history", chat_history_for_chain)
+        history = to_gradio_history(final_lc_history)
+
+        # 현재 사용자의 질문과 최종 답변을 히스토리에 추가
         history.append({"role": "user", "content": query})
         history.append({"role": "assistant", "content": answer})
 

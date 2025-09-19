@@ -33,6 +33,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.stores import BaseStore  # ✅ BaseStore는 여기로 이동됨
+from langchain_core.messages import BaseMessage
 
 # LangGraph
 from langgraph.graph import END, START, StateGraph
@@ -46,6 +47,27 @@ from langchain_tavily import TavilySearch
 
 # --- Add: Persistent JSON-backed DocStore for parents ---
 
+# --------------------------
+# 유틸: Gradio용 히스토리 변환
+# --------------------------
+def to_lc_messages(history: List[dict]) -> List:
+    msgs = []
+    for m in history:
+        if m["role"] == "user":
+            msgs.append(HumanMessage(content=m["content"]))
+        elif m["role"] == "assistant":
+            msgs.append(AIMessage(content=m["content"]))
+    return msgs
+
+
+# --------------------------
+# 전역 Debug Log 저장소
+# --------------------------
+debug_logs = []
+
+def log_debug(msg: str):
+    debug_logs.append(msg)
+    print(msg)  # 콘솔에도 그대로 찍어줌
 
 class JSONDocStore(BaseStore[str, Document]):
     """
@@ -222,7 +244,6 @@ ga_system_prompt = (
     "You are a helpful assistant. Your task is to answer the user's question based on the provided context. "
     "The context may come from PDF documents or from web search results. "
     "If useful information is present in the context (including web search), provide a concise answer. "
-    "If the answer cannot be found within the provided context, you MUST say '제공된 문서나 검색 결과의 내용으로는 답변할 수 없습니다.' "
     "\n\nContext:\n{context}"
 )
 
@@ -287,7 +308,8 @@ class GraphState(TypedDict):
     generation: str
     web_search: str
     documents: List[Document]
-    chat_history: List  # HumanMessage/AIMessage 리스트
+    chat_history: List[BaseMessage]  # 항상 HumanMessage/AIMessage만
+
 
 
 # --------------------------
@@ -360,7 +382,7 @@ def node_grade_documents(state: GraphState) -> GraphState:
 
 def node_decide_to_generate(state: GraphState) -> str:
     print("---ASSESS GRADED DOCUMENTS---")
-    return "transform_query" if state["web_search"] == "Yes" else "generate"
+    return "notify_user" if state["web_search"] == "Yes" else "generate"
 
 def node_transform_query(state: GraphState) -> GraphState:
     print("---TRANSFORM QUERY---")
@@ -379,19 +401,28 @@ def node_web_search(state: GraphState) -> GraphState:
     question = state["question"]
 
     if web_search_tool is None:
-        # 웹검색 불가 시 안내 문서 추가
         web_results_text = "웹검색 API 키가 설정되지 않아 웹검색을 수행하지 못했습니다."
     else:
         try:
             results = web_search_tool.invoke({"query": question})
-            lines = []
-            for r in results:
-                # r keys: content, url, score, title 등
-                title = r.get("title") or ""
-                url = r.get("url") or ""
-                content = r.get("content") or ""
-                lines.append(f"[{title}] {url}\n{content}\n")
-            web_results_text = "\n---\n".join(lines) if lines else "검색결과가 비어 있습니다."
+
+            # ✅ 결과가 문자열일 때 대비
+            if isinstance(results, str):
+                web_results_text = results
+            elif isinstance(results, list):
+                lines = []
+                for r in results:
+                    if isinstance(r, dict):  # dict 타입만 처리
+                        title = r.get("title", "")
+                        url = r.get("url", "")
+                        content = r.get("content", "")
+                        lines.append(f"[{title}] {url}\n{content}\n")
+                    else:
+                        lines.append(str(r))  # dict가 아니면 문자열 변환
+                web_results_text = "\n---\n".join(lines) if lines else "검색결과가 비어 있습니다."
+            else:
+                web_results_text = str(results)
+
         except Exception as e:
             web_results_text = f"웹검색 중 오류: {e}"
 
@@ -403,6 +434,7 @@ def node_web_search(state: GraphState) -> GraphState:
         "chat_history": state["chat_history"],
         "generation": state.get("generation", ""),
     }
+
 
 def node_generate(state: GraphState) -> GraphState:
     print("---GENERATE---")
@@ -433,22 +465,43 @@ def node_generate(state: GraphState) -> GraphState:
 
 
 # --------------------------
+# 새 노드: 사용자 알림
+# --------------------------
+def node_notify_user(state: GraphState) -> GraphState:
+    log_debug("---NOTIFY USER---")
+    notice = "문서에서 답변을 찾지 못했습니다. 인터넷 검색을 시도합니다."
+    chat_history = state.get("chat_history", [])
+    chat_history.append(AIMessage(content=notice))  # ✅ dict로만 유지
+    return {**state, "chat_history": chat_history}
+
+
+
+# --------------------------
 # 그래프 구성 & 컴파일
 # --------------------------
 workflow = StateGraph(GraphState)
 workflow.add_node("retrieve", node_retrieve)
 workflow.add_node("grade_documents", node_grade_documents)
 workflow.add_node("generate", node_generate)
+workflow.add_node("notify_user", node_notify_user)   # ✅ 추가
 workflow.add_node("transform_query", node_transform_query)
 workflow.add_node("web_search_node", node_web_search)
 
 workflow.add_edge(START, "retrieve")
 workflow.add_edge("retrieve", "grade_documents")
+
+# 조건 분기 수정
 workflow.add_conditional_edges(
     "grade_documents",
     node_decide_to_generate,
-    {"transform_query": "transform_query", "generate": "generate"},
+    {
+        "generate": "generate",            # 문서 관련성 O → 바로 답변
+        "notify_user": "notify_user",  # 문서 관련성 X → 먼저 notify_user
+    },
 )
+
+# 알림 후 웹검색 분기 연결
+workflow.add_edge("notify_user", "transform_query")
 workflow.add_edge("transform_query", "web_search_node")
 workflow.add_edge("web_search_node", "generate")
 workflow.add_edge("generate", END)
@@ -456,27 +509,6 @@ workflow.add_edge("generate", END)
 app = workflow.compile()
 
 
-# --------------------------
-# 유틸: Gradio용 히스토리 변환
-# --------------------------
-def to_lc_messages(history: List[dict]) -> List:
-    msgs = []
-    for m in history:
-        if m["role"] == "user":
-            msgs.append(HumanMessage(content=m["content"]))
-        elif m["role"] == "assistant":
-            msgs.append(AIMessage(content=m["content"]))
-    return msgs
-
-
-# --------------------------
-# 전역 Debug Log 저장소
-# --------------------------
-debug_logs = []
-
-def log_debug(msg: str):
-    debug_logs.append(msg)
-    print(msg)  # 콘솔에도 그대로 찍어줌
 
 
 # --------------------------

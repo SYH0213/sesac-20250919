@@ -11,3 +11,4 @@ langchain-tavily>=0.1.0
 # 기타 유틸
 python-dotenv>=1.0.1
 llama-parse>=0.4.0
+google

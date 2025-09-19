@@ -3,8 +3,10 @@
 */__pycache__
 chroma_db/
 chroma_db2/
+chroma_db3/
 chroma_db10/
 dummy/
 .gradio
 .obsidian
-parent_store/
+parent_store3/
+__pycache__/
