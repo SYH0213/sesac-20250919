@@ -1,0 +1,13 @@
+openai>=1.51.0
+gradio>=4.44.0
+
+# Chroma & LangChain
+chromadb>=0.5,<0.6
+langchain>=0.3.7
+langchain-openai>=0.2.6
+langchain-chroma>=0.1.6
+langchain-tavily>=0.1.0
+
+# 기타 유틸
+python-dotenv>=1.0.1
+llama-parse>=0.4.0
