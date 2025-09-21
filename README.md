@@ -109,37 +109,7 @@ LangGraph를 사용해 파이프라인을 재설계 했고, CRAG(Corrective RAG)
 
 ### 파이프라인
 
-[START]
-   │
-   ▼
-[classify_input]  ── 의도분류 → { conversational | question }
-   │
-   ├─ if conversational ───────────────► [generate_conversational_response] ─► (END)
-   │
-   └─ if question
-        │
-        ▼
-    [retrieve] ──(history-aware)──► 문서 검색
-        │
-        ▼
- [grade_documents] ── 문서 관련성 평가
-        │
-        ├─ 관련 문서 있음(Yes) ─► [generate] ────────────────────────────────► (END)
-        │
-        └─ 관련 문서 없음(No)
-                 │
-                 ▼
-          [notify_user] ── "문서에서 답변 실패, 웹검색 시도"
-                 │
-                 ▼
-        [transform_query] ── 검색 친화적 쿼리로 재작성
-                 │
-                 ▼
-         [web_search_node] ── (Tavily) 웹결과를 문맥으로 추가
-                 │
-                 ▼
-               [generate] ───────────────────────────────────────────────────► (END)
-
+![이미지10](./images/10.png)
 
 ---
 
