@@ -273,7 +273,7 @@ def get_retriever_for_pdf(pdf_filename: str):
                 docstore=store,
                 child_splitter=child_splitter,
                 parent_splitter=parent_splitter,
-                search_kwargs={"k": 4},
+                search_kwargs={"k": 2},
             )
         
         # 5. 캐시에 저장
@@ -822,9 +822,9 @@ def run_crag(query: str, history: List[dict], selected_pdf: str, show_debug: boo
 # Gradio UI 구성
 # --------------------------
 example_questions = [
-    "Gemini 2.5 Pro와 Flash 모델의 입력 길이와 출력 길이는 각각 어떻게 다르며, 도구 사용 지원 여부는 무엇인가요?”",
-    "TPUv5p 인프라에서 Gemini 2.5 학습 시 도입된 Slice-Granularity Elasticity와 Split-Phase SDC Detection은 어떤 문제를 해결했나요?",
-    "Gemini 2.5 Deep Think 접근법은 어떤 방식으로 답변을 생성하며, 어떤 벤치마크에서 두각을 나타냈나요?",
+    "Gemini 2.5 Pro는 Gemini 1.5 Pro와 비교했을 때 어떤 점에서 향상되었나요?",
+    "Gemini 2.5 Pro와 Flash는 어떤 종류의 데이터를 처리할 수 있나요?",
+    "Gemini 2.5 시리즈의 작은 모델들은 어떤 방식으로 성능을 개선했나요?",
 ]
 
 with gr.Blocks(theme="soft", title="Dynamic PDF RAG + CRAG Chatbot") as demo:
@@ -841,8 +841,7 @@ with gr.Blocks(theme="soft", title="Dynamic PDF RAG + CRAG Chatbot") as demo:
                 pdf_selector = gr.Dropdown(
                     label="분석할 PDF 문서 선택",
                     choices=get_pdf_list(),
-                    interactive=True,
-                    value=None,
+                    interactive=True
                 )
                 upload_button = gr.UploadButton("PDF 업로드", file_types=[".pdf"])
                 status_display = gr.Markdown("대기 중...")
@@ -857,7 +856,7 @@ with gr.Blocks(theme="soft", title="Dynamic PDF RAG + CRAG Chatbot") as demo:
                 label="예시 질문"
             )
 
-        with gr.Column(scale=1):
+        with gr.Column(scale=2):
             context_display = gr.Markdown(label="LLM 참조 문서")
             with gr.Accordion("⚙️ Advanced Options", open=False):
                 show_debug_checkbox = gr.Checkbox(label="Show Debug Logs", value=False)

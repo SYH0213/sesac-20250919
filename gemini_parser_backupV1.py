@@ -19,7 +19,7 @@ except Exception as e:
 
 def parse_pdf_to_markdown(pdf_path: str, output_dir: str = "loaddata") -> str:
     """
-    Gemini 2.5 pro 모델을 사용하여 PDF 파일에서 텍스트와 표를 추출하고,
+    Gemini 2.5 flash 모델을 사용하여 PDF 파일에서 텍스트와 표를 추출하고,
     그 결과를 마크다운 파일로 저장합니다. (genai.Client() 구문 사용 버전)
 
     Args:
@@ -49,18 +49,17 @@ def parse_pdf_to_markdown(pdf_path: str, output_dir: str = "loaddata") -> str:
     try:
         print(f"[INFO] '{pdf_path}'를 Gemini File API에 업로드 중...")
         file_to_parse = client.files.upload(file=pathlib.Path(pdf_path))
-        print(file_to_parse)
+
         prompt = """
         I am going to generate a markdown file by extracting the text content from a PDF file. Please proceed in the following order:
         1. The PDF contains various texts, tables, and charts. Extract only the text and tables. Remove headers and footers. Preserve the original language of the document.
         2. Generate a markdown file from the extracted content.
         """
 
-        print(f"[INFO] Gemini 2.5 pro PDF 콘텐츠 생성 중...")
+        print(f"[INFO] Gemini 2.5 flash PDF 콘텐츠 생성 중...")
         response = client.models.generate_content(
-            model="gemini-2.5-pro", contents=[file_to_parse, prompt]
+            model="gemini-2.5-flash", contents=[file_to_parse, prompt]
         )
-
 
         if not response.candidates:
             feedback = response.prompt_feedback

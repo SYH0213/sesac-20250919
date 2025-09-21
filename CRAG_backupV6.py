@@ -43,8 +43,6 @@ import traceback
 import gradio as gr
 from dotenv import load_dotenv
 from gemini_parser import parse_pdf_to_markdown
-import pathlib
-import shutil
 
 # Python typing
 from typing import Iterable, Optional, Tuple, List
@@ -178,8 +176,10 @@ TAVILY_KEY = os.getenv("TAVILY_API_KEY")  # 없으면 웹검색 보강은 건너
 # --------------------------
 # 경로 및 전역 설정
 # --------------------------
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+PDF_NAME = "gemini-2.5-tech_1-3"
+PDF_PATH = "data/"+PDF_NAME+".pdf"
+PARSED_MD_PATH = "loaddata/gemini_parsed_"+PDF_NAME+".md"
+CHROMA_DB_DIR = "./chroma_db3"
 
 # --------------------------
 # LLM & 임베딩
@@ -193,100 +193,24 @@ embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 parent_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
 child_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
 
-# --------------------------------------
-# 동적 경로 관리 헬퍼
-# --------------------------------------
-def get_paths_for_pdf(pdf_filename: str):
-    """선택된 PDF 파일명에 따라 동적으로 경로들을 생성합니다."""
-    if not pdf_filename:
-        return None
-    
-    base_name = pathlib.Path(pdf_filename).stem
-    
-    pdf_path = os.path.join(DATA_DIR, pdf_filename)
-    parsed_md_path = f"loaddata/gemini_parsed_{base_name}.md"
-    chroma_db_dir = f"./chroma_db/{base_name}"
-    parent_store_dir = f"./parent_store/{base_name}"
-    
-    return {
-        "pdf_path": pdf_path,
-        "md_path": parsed_md_path,
-        "chroma_dir": chroma_db_dir,
-        "store_dir": parent_store_dir,
-    }
+# --------------------------
+# Vector Store (Chroma)
+# --------------------------
+vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings)
 
-# --------------------------------------
-# Retriever 및 Vectorstore 관리
-# --------------------------------------
-retriever_cache = {}
+# --------------------------
+# ParentDocumentRetriever
+# --------------------------
+# 기존: store = InMemoryStore()
+store = JSONDocStore("./parent_store3")  # 파일 기반 parent 저장
 
-def get_retriever_for_pdf(pdf_filename: str):
-    """
-    선택된 PDF에 대한 retriever를 가져오거나 생성합니다.
-    - 캐시 확인 -> 없으면 생성 -> 캐시에 저장
-    - Vectorstore가 비어있으면 문서를 파싱하고 DB를 채웁니다.
-    """
-    if not pdf_filename:
-        return None, "PDF 파일을 선택해주세요."
-
-    if pdf_filename in retriever_cache:
-        log_debug(f"캐시에서 '{pdf_filename}'에 대한 retriever를 로드합니다.")
-        return retriever_cache[pdf_filename], f"'{pdf_filename}'에 대한 준비가 완료되었습니다."
-
-    paths = get_paths_for_pdf(pdf_filename)
-    if not paths:
-        return None, "경로 생성에 실패했습니다."
-
-    try:
-        # 1. Vectorstore 및 Docstore 초기화
-        vectorstore = Chroma(persist_directory=paths["chroma_dir"], embedding_function=embeddings)
-        store = JSONDocStore(paths["store_dir"])
-
-        # 2. Vectorstore가 비어있는지 확인
-        if vectorstore._collection.count() == 0:
-            log_debug(f"'{paths['chroma_dir']}'가 비어있습니다. 문서 파싱 및 임베딩을 시작합니다.")
-            
-            # 3. (필요 시) PDF 파싱
-            os.makedirs(os.path.dirname(paths["md_path"]), exist_ok=True)
-            markdown_file_path = parse_pdf_to_markdown(paths["pdf_path"], output_dir=os.path.dirname(paths["md_path"]))
-            
-            with open(markdown_file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-            
-            documents = [Document(page_content=text, metadata={"source": markdown_file_path})]
-            
-            # 4. Retriever 생성 및 문서 추가
-            retriever = ParentDocumentRetriever(
-                vectorstore=vectorstore,
-                docstore=store,
-                child_splitter=child_splitter,
-                parent_splitter=parent_splitter,
-                search_kwargs={"k": 2},
-            )
-            retriever.add_documents(documents)
-            log_debug(f"Vector store가 성공적으로 생성되었습니다. Count: {vectorstore._collection.count()}")
-
-        else:
-            log_debug(f"기존 vector store를 로드합니다. Count: {vectorstore._collection.count()}")
-            retriever = ParentDocumentRetriever(
-                vectorstore=vectorstore,
-                docstore=store,
-                child_splitter=child_splitter,
-                parent_splitter=parent_splitter,
-                search_kwargs={"k": 4},
-            )
-        
-        # 5. 캐시에 저장
-        retriever_cache[pdf_filename] = retriever
-        return retriever, f"'{pdf_filename}'에 대한 준비가 완료되었습니다."
-
-    except Exception as e:
-        error_msg = f"""'{pdf_filename}' 처리 중 오류 발생: {e}
-{traceback.format_exc()}"""
-        log_debug(error_msg)
-        return None, error_msg
-
-
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,
+    docstore=store,
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+    search_kwargs={"k": 2},
+)
 
 
 # --------------------------
@@ -349,6 +273,7 @@ contextualize_q_prompt = ChatPromptTemplate.from_messages(
         ("human", "{input}"),
     ]
 )
+history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
 
 # --------------------------
 # 최종 답변(문서 기반만 허용) Chain
@@ -424,7 +349,6 @@ class GraphState(TypedDict):
     documents: List[Document]
     chat_history: List[BaseMessage]
     intent: str  # "conversational" or "question"
-    retriever: Optional[ParentDocumentRetriever]
 
 
 # --------------------------------------
@@ -491,22 +415,33 @@ def node_generate_conversational_response(state: GraphState) -> GraphState:
 # LangGraph 노드 함수
 # --------------------------
 def node_retrieve(state: GraphState) -> GraphState:
-    """선택된 retriever를 사용하여 문서를 검색합니다."""
     log_debug("---RETRIEVE---")
+
     question = state["question"]
     chat_history = state.get("chat_history", [])
-    retriever = state.get("retriever")
 
-    if not retriever:
-        raise ValueError("Retriever가 설정되지 않았습니다. 문서를 먼저 선택하고 로드해주세요.")
+    # 원 질문 + 히스토리 출력
+    log_debug(f"[DEBUG] Raw Question: {question}")
+    if chat_history:
+        log_debug(f"[DEBUG] Chat History Count: {len(chat_history)}")
+    else:
+        log_debug("[DEBUG] No chat history provided.")
 
-    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+    # Child 검색 결과 확인
+    child_results = vectorstore.similarity_search(question, k=2)
+    log_debug("=== Child 검색 결과 ===")
+    for i, d in enumerate(child_results, 1):
+        log_debug(f"[Child {i}] Parent ID: {d.metadata.get('doc_id')}")
+        log_debug(f"Snippet: {d.page_content[:200]}...\n")
 
     # Parent 복구 결과 (History-aware retriever 사용)
     docs = history_aware_retriever.invoke(
         {"input": question, "chat_history": chat_history}
     )
-    log_debug(f"--- Retrieved {len(docs)} documents ---")
+    log_debug("=== Parent 복구 결과 ===")
+    for i, d in enumerate(docs, 1):
+        log_debug(f"[Parent {i}] Source: {d.metadata.get('source', 'N/A')}")
+        log_debug(f"Snippet: {d.page_content[:500]}...\n")
 
     return {
         "documents": docs,
@@ -701,102 +636,24 @@ app = workflow.compile()
 
 
 # --------------------------
-# Gradio UI 및 이벤트 핸들러
+# run_crag 수정
 # --------------------------
-def get_pdf_list():
-    """'data' 디렉토리에서 PDF 파일 목록을 가져옵니다."""
-    return [f.name for f in pathlib.Path(DATA_DIR).glob("*.pdf")]
-
-def handle_file_upload(file):
-    """파일 업로드 시 호출됩니다."""
-    if file is None:
-        return gr.update(choices=get_pdf_list())
-    
-    dest_path = pathlib.Path(DATA_DIR) / pathlib.Path(file.name).name
-    shutil.copy(file.name, dest_path)
-    
-    # 캐시에서 해당 파일이 있다면 삭제하여 리로드를 강제
-    if dest_path.name in retriever_cache:
-        del retriever_cache[dest_path.name]
-        
-    return gr.update(choices=get_pdf_list(), value=dest_path.name)
-
-def handle_pdf_selection(pdf_filename, progress=gr.Progress()):
-    """드롭다운에서 PDF를 선택했을 때 호출됩니다."""
-    if not pdf_filename:
-        return "분석할 PDF 파일을 선택해주세요.", ""
-
-    progress(0, desc="문서 처리 준비 중...")
-    retriever, msg = get_retriever_for_pdf(pdf_filename)
-    progress(1, desc=msg)
-    
-    return msg, pdf_filename
-
-def run_crag(query: str, history: List[dict], selected_pdf: str, show_debug: bool):
-    """
-    메인 CRAG 실행 함수. 채팅 메시지 제출 시 호출됩니다.
-    UI의 모든 입력을 받아 LangGraph를 실행하고 결과를 스트리밍으로 반환합니다.
-    """
+def run_crag(query: str, history: List[dict], show_debug: bool):
     global debug_logs
-    debug_logs = []
+    debug_logs = []  # 실행할 때마다 초기화
 
-    # --- 입력 유효성 검사 ---
-    if not query:
-        history.append({"role": "user", "content": ""})
-        history.append({"role": "assistant", "content": "질문을 입력해주세요."})
-        yield "", history, "질문을 입력해주세요.", ""
-        return
-
-    if not selected_pdf:
-        history.append({"role": "user", "content": query})
-        history.append({"role": "assistant", "content": "먼저 분석할 PDF 문서를 선택해주세요."})
-        yield "", history, "PDF 문서를 선택해주세요.", ""
-        return
-
-    # --- Retriever 준비 ---
-    retriever, msg = get_retriever_for_pdf(selected_pdf)
-    if not retriever:
-        history.append({"role": "user", "content": query})
-        history.append({"role": "assistant", "content": f"문서 준비 중 오류가 발생했습니다: {msg}"})
-        yield "", history, msg, ""
-        return
-
-    # --- LangGraph 실행 ---
     chat_history_for_chain = to_lc_messages(history or [])
-    
     try:
-        inputs = {
-            "question": query, 
-            "chat_history": chat_history_for_chain,
-            "retriever": retriever
-        }
-        
-        # 사용자 질문을 히스토리에 먼저 추가
-        history.append({"role": "user", "content": query})
-        
-        # 스트리밍 실행 및 답변 생성
-        generation = ""
-        final_state = {}
+        final_state = None
+        inputs = {"question": query, "chat_history": chat_history_for_chain,
+                  "documents": [], "web_search": "No", "generation": ""}
         for step in app.stream(inputs):
-            node_name = list(step.keys())[0]
-            final_state = step[node_name]
-            log_debug(f"[TRACE] Node '{node_name}' passed.")
-            
-            # 웹 검색 시 중간 알림
-            if node_name == "grade_documents" and final_state.get("web_search") == "Yes":
-                history.append({"role": "assistant", "content": "문서에서 답변을 찾지 못했습니다. 인터넷 검색을 시도합니다."})
-                yield "", history, "웹 검색을 시작합니다...", ""
+            for node_name, node_state in step.items():
+                log_debug(f"[TRACE] Node '{node_name}' passed.")
+            final_state = node_state
 
-            if "generation" in final_state and final_state["generation"]:
-                 generation = final_state["generation"]
-
-        # 최종 답변을 히스토리에 추가/업데이트
-        if history[-1]["role"] == "assistant": # 웹 검색 알림이 있었던 경우
-            history[-1]["content"] = generation
-        else:
-            history.append({"role": "assistant", "content": generation})
-
-        # --- 결과 표시 ---
+        # 최종 응답
+        answer = final_state.get("generation", "제공된 문서의 내용으로는 답변할 수 없습니다.")
         docs: List[Document] = final_state.get("documents", [])
         context_md = "## 참조 문서\n\n"
         if docs:
@@ -807,80 +664,86 @@ def run_crag(query: str, history: List[dict], selected_pdf: str, show_debug: boo
         else:
             context_md += "참조된 문서가 없습니다."
 
+        # 히스토리 추가 (수정된 로직)
+        # 그래프 실행 후의 최종 대화 기록을 가져옴 (여기엔 notify 메시지 등이 포함될 수 있음)
+        final_lc_history = final_state.get("chat_history", chat_history_for_chain)
+        history = to_gradio_history(final_lc_history)
+
+        # 현재 사용자의 질문과 최종 답변을 히스토리에 추가
+        history.append({"role": "user", "content": query})
+        history.append({"role": "assistant", "content": answer})
+
+        # 디버그 표시 여부 결정
         debug_output = "### Debug Logs\n```\n" + "\n".join(debug_logs) + "\n```" if show_debug else ""
-        
-        yield "", history, context_md, debug_output
+        return "", history, context_md, debug_output
 
     except Exception as e:
         err = f"오류 발생: {e}\n{traceback.format_exc()}"
         debug_output = "### 오류\n```\n" + err + "\n```"
-        history.append({"role": "assistant", "content": "죄송합니다. 답변 생성 중 오류가 발생했습니다."})
-        yield "", history, "오류가 발생했습니다.", debug_output
+        return "", history, "참조된 문서가 없습니다.", debug_output
+
+
+
+def force_reload_vectorstore():
+    try:
+        print("[INFO] Resetting Chroma client...")
+        vectorstore._client.reset()  # 전체 컬렉션 초기화
+        load_and_populate_vectorstore()
+        return "✅ Vector store reloaded successfully!"
+    except Exception as e:
+        return f"❌ Error during vector store reload: {e}"
 
 
 # --------------------------
-# Gradio UI 구성
+# 초기 적재
+# --------------------------
+load_and_populate_vectorstore()
+
+# --------------------------
+# Gradio UI
 # --------------------------
 example_questions = [
-    "Gemini 2.5 Pro와 Flash 모델의 입력 길이와 출력 길이는 각각 어떻게 다르며, 도구 사용 지원 여부는 무엇인가요?”",
-    "TPUv5p 인프라에서 Gemini 2.5 학습 시 도입된 Slice-Granularity Elasticity와 Split-Phase SDC Detection은 어떤 문제를 해결했나요?",
-    "Gemini 2.5 Deep Think 접근법은 어떤 방식으로 답변을 생성하며, 어떤 벤치마크에서 두각을 나타냈나요?",
+    "Gemini 2.5 Pro는 Gemini 1.5 Pro와 비교했을 때 어떤 점에서 향상되었나요?",
+    "Gemini 2.5 Pro와 Flash는 어떤 종류의 데이터를 처리할 수 있나요?",
+    "Gemini 2.5 시리즈의 작은 모델들은 어떤 방식으로 성능을 개선했나요?",
 ]
 
-with gr.Blocks(theme="soft", title="Dynamic PDF RAG + CRAG Chatbot") as demo:
-    gr.Markdown("# Dynamic PDF RAG + CRAG Chatbot")
-    gr.Markdown("좌측 상단에서 분석할 PDF를 선택하거나 새 파일을 업로드하세요. 문서가 준비되면 질문을 시작할 수 있습니다.")
-
-    # 현재 선택된 PDF 파일명을 저장하기 위한 상태
-    selected_pdf_state = gr.State()
+with gr.Blocks(theme="soft", title="PDF RAG + CRAG Chatbot") as demo:
+    gr.Markdown("# PDF RAG + CRAG Chatbot (LlamaParse / ParentRetriever / History-Aware / Web Search)")
+    gr.Markdown("PDF 문서 내용에 대해 질문하세요. 문서에서 못 찾으면 질문 재작성 + (선택)웹검색으로 보강합니다.")
 
     with gr.Row():
+        # ------------------------------
+        # 왼쪽: 채팅 영역
+        # ------------------------------
         with gr.Column(scale=1):
-            # --- 파일 관리 섹션 ---
-            with gr.Accordion("1. 문서 선택 및 관리", open=True):
-                pdf_selector = gr.Dropdown(
-                    label="분석할 PDF 문서 선택",
-                    choices=get_pdf_list(),
-                    interactive=True,
-                    value=None,
-                )
-                upload_button = gr.UploadButton("PDF 업로드", file_types=[".pdf"])
-                status_display = gr.Markdown("대기 중...")
-
-            # --- 채팅 섹션 ---
             chatbot = gr.Chatbot(height=420, label="Chat", type="messages", value=[])
             msg = gr.Textbox(label="질문을 입력하세요... (Shift+Enter 줄바꿈)")
-            
+
             gr.Examples(
                 examples=example_questions,
                 inputs=msg,
                 label="예시 질문"
             )
 
-        with gr.Column(scale=1):
-            context_display = gr.Markdown(label="LLM 참조 문서")
+        # ------------------------------
+        # 오른쪽: 문서/옵션/디버그 영역
+        # ------------------------------
+        with gr.Column(scale=2):
+            context_display = gr.Markdown(label="LLM 참조 문서 전문/요약")
+
             with gr.Accordion("⚙️ Advanced Options", open=False):
                 show_debug_checkbox = gr.Checkbox(label="Show Debug Logs", value=False)
-                debug_panel = gr.Markdown(label="Debug Logs")
+                debug_panel = gr.Markdown(label="Debug Logs")   # ✅ 디버그 로그 출력 패널
+                reload_button = gr.Button("🔄 Force Reload Vector Store")
+                reload_status = gr.Markdown()
 
-    # --- 이벤트 핸들러 바인딩 ---
-    clear = gr.ClearButton([msg, chatbot, context_display, debug_panel, status_display])
-
-    # 1. 파일 업로드 시: 파일을 서버에 저장하고, 드롭다운 목록을 갱신
-    upload_button.upload(handle_file_upload, inputs=[upload_button], outputs=[pdf_selector])
-
-    # 2. 드롭다운에서 PDF 선택 시: 해당 PDF에 대한 retriever를 준비/로드
-    pdf_selector.change(
-        handle_pdf_selection, 
-        inputs=[pdf_selector], 
-        outputs=[status_display, selected_pdf_state]
-    )
-
-    # 3. 메시지 전송 시: CRAG 파이프라인 실행
-    msg.submit(
-        run_crag, 
-        [msg, chatbot, selected_pdf_state, show_debug_checkbox],
-        [msg, chatbot, context_display, debug_panel]
-    )
+    # ------------------------------
+    # 버튼/이벤트 바인딩
+    # ------------------------------
+    clear = gr.ClearButton([msg, chatbot, context_display, debug_panel])
+    msg.submit(run_crag, [msg, chatbot, show_debug_checkbox],
+               [msg, chatbot, context_display, debug_panel])
+    reload_button.click(force_reload_vectorstore, outputs=reload_status)
 
 demo.launch()
